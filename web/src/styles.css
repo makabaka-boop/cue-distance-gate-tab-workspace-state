@@ -210,6 +210,28 @@ details pre {
   color: #dfe3ee;
 }
 
+/* Inactive tab panels stay mounted (in-flight requests must keep reaching
+   their stores); the hidden attribute only removes them from view. */
+[role='tabpanel'][hidden] {
+  display: none;
+}
+
+.busy-note {
+  color: #8fb0ff;
+  background: rgba(79, 124, 255, 0.1);
+  border: 1px solid rgba(79, 124, 255, 0.4);
+  border-radius: 8px;
+  padding: 8px 14px;
+  margin: 0 0 16px;
+  font-size: 0.85rem;
+}
+
+.identity-line {
+  margin: 0 0 10px;
+  color: #9aa0b0;
+  font-size: 0.82rem;
+}
+
 /* ----------------------------------------------------- session console */
 
 .console-entry {

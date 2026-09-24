@@ -1,76 +1,9 @@
-import { useState } from 'react';
-import { ApiError, fetchDistance, type DistanceResponse } from './api';
-
-const SAMPLE_PLAN = '[101, 102, 103, 104, 105, 106, 107, 108]';
-const SAMPLE_LIVE = '[101, 102, 104, 105, 205, 106, 107]';
-
-class ClientError extends Error {
-  readonly code: string;
-  constructor(code: string, message: string) {
-    super(message);
-    this.code = code;
-  }
-}
-
-type Outcome =
-  | { kind: 'result'; value: DistanceResponse }
-  | { kind: 'error'; code: string; message: string };
-
-function parseJsonArray(text: string, label: string): unknown[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new ClientError(
-      'INVALID_JSON',
-      `${label}不是合法的 JSON，请输入标准 JSON 数组（例如 [1, 2, 3]）。`,
-    );
-  }
-  if (!Array.isArray(parsed)) {
-    throw new ClientError('INVALID_BODY', `${label}必须是 JSON 数组。`);
-  }
-  return parsed;
-}
-
-function parseK(text: string): number {
-  const k = Number(text);
-  if (text.trim() === '' || !Number.isInteger(k) || k < 0 || k > 500) {
-    throw new ClientError('INVALID_K', '阈值 K 必须是 0 到 500 之间的整数。');
-  }
-  return k;
-}
+import { DeviationStore, useStore } from './stores';
 
 /** Independent entry 1: planned-vs-live cue sequence deviation checker. */
-export default function DeviationChecker() {
-  const [planText, setPlanText] = useState(SAMPLE_PLAN);
-  const [liveText, setLiveText] = useState(SAMPLE_LIVE);
-  const [kText, setKText] = useState('3');
-  const [busy, setBusy] = useState(false);
-  const [outcome, setOutcome] = useState<Outcome | null>(null);
-
-  async function onCompare() {
-    setBusy(true);
-    setOutcome(null);
-    try {
-      const a = parseJsonArray(planText, '计划 cue 序列');
-      const b = parseJsonArray(liveText, '现场触发序列');
-      const k = parseK(kText);
-      const value = await fetchDistance(a, b, k);
-      setOutcome({ kind: 'result', value });
-    } catch (err) {
-      if (err instanceof ClientError || err instanceof ApiError) {
-        setOutcome({ kind: 'error', code: err.code, message: err.message });
-      } else {
-        setOutcome({
-          kind: 'error',
-          code: 'NETWORK',
-          message: '无法连接校验服务，请确认 API 已启动。',
-        });
-      }
-    } finally {
-      setBusy(false);
-    }
-  }
+export default function DeviationChecker({ store }: { store: DeviationStore }) {
+  const s = useStore(store);
+  const { outcome } = s;
 
   return (
     <section>
@@ -78,8 +11,8 @@ export default function DeviationChecker() {
         <label className="editor">
           <span>计划 cue 序列（JSON 整数数组，≤ 50000 项）</span>
           <textarea
-            value={planText}
-            onChange={(e) => setPlanText(e.target.value)}
+            value={s.planText}
+            onChange={(e) => store.setPlanText(e.target.value)}
             spellCheck={false}
             rows={10}
             placeholder="[101, 102, 103]"
@@ -88,8 +21,8 @@ export default function DeviationChecker() {
         <label className="editor">
           <span>现场触发序列（JSON 整数数组，≤ 50000 项）</span>
           <textarea
-            value={liveText}
-            onChange={(e) => setLiveText(e.target.value)}
+            value={s.liveText}
+            onChange={(e) => store.setLiveText(e.target.value)}
             spellCheck={false}
             rows={10}
             placeholder="[101, 102, 104]"
@@ -105,18 +38,27 @@ export default function DeviationChecker() {
             min={0}
             max={500}
             step={1}
-            value={kText}
-            onChange={(e) => setKText(e.target.value)}
+            value={s.kText}
+            onChange={(e) => store.setKText(e.target.value)}
           />
         </label>
-        <button onClick={onCompare} disabled={busy}>
-          {busy ? '校验中…' : '比较'}
+        <button onClick={() => store.compare()} disabled={s.busy}>
+          {s.busy ? '校验中…' : '比较'}
         </button>
       </section>
+
+      {s.pending && (
+        <p className="busy-note" role="status">
+          校验请求 #{s.pending.seq} 进行中
+          （{s.pending.lengths.a} / {s.pending.lengths.b} 项，K = {s.pending.k}，
+          指纹 <code>{s.pending.fingerprint}</code>）：切换页签后，返回的结论仍归属于本次请求。
+        </p>
+      )}
 
       {outcome?.kind === 'error' && (
         <section className="verdict error" role="alert">
           <h2>❌ 输入无效</h2>
+          {outcome.identity && <IdentityLine identity={outcome.identity} />}
           <p>
             <code>{outcome.code}</code>：{outcome.message}
           </p>
@@ -128,6 +70,7 @@ export default function DeviationChecker() {
           className={outcome.value.status === 'ok' ? 'verdict ok' : 'verdict exceeded'}
           role="status"
         >
+          <IdentityLine identity={outcome.identity} />
           {outcome.value.status === 'ok' ? (
             <>
               <h2>✅ 偏差在容许范围内</h2>
@@ -169,5 +112,19 @@ export default function DeviationChecker() {
         </section>
       )}
     </section>
+  );
+}
+
+/** Which request this verdict answers — distinguishes consecutive conclusions. */
+function IdentityLine({
+  identity,
+}: {
+  identity: { seq: number; fingerprint: string; lengths: { a: number; b: number }; k: number };
+}) {
+  return (
+    <p className="identity-line">
+      结论归属：请求 #{identity.seq}（{identity.lengths.a} / {identity.lengths.b} 项，
+      K = {identity.k}，输入指纹 <code>{identity.fingerprint}</code>）
+    </p>
   );
 }
