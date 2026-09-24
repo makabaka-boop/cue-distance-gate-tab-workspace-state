@@ -47,7 +47,16 @@ export default function PerformanceConsole() {
   const [loadBusy, setLoadBusy] = useState(false);
   const [name, setName] = useState('');
   const [loadId, setLoadId] = useState('');
-  const [cueText, setCueText] = useState('');
+  // The cue draft belongs to the session it was typed for: keep one draft per
+  // performance id so switching the displayed session (e.g. a load while a
+  // command is in flight) never leaks one session's uncommitted cue into
+  // another session's input.
+  const [cueDrafts, setCueDrafts] = useState<Record<string, string>>({});
+  const cueText = session ? (cueDrafts[session.id] ?? '') : '';
+
+  function setCueTextFor(performanceId: string, text: string) {
+    setCueDrafts((drafts) => ({ ...drafts, [performanceId]: text }));
+  }
 
   // Monotonic token of the last user-initiated request. Responses that were
   // superseded by a later action must never touch the view: otherwise a slow
@@ -75,28 +84,45 @@ export default function PerformanceConsole() {
    * a GET must never downgrade a version a command already committed. A
    * response superseded by a newer action may only catch the same session up
    * in version — it can never switch sessions or surface a stale error.
+   *
+   * Returns true only when the snapshot was applied to the session currently
+   * on screen; callers use this to gate follow-ups that belong to that
+   * session (such as clearing its cue draft).
    */
-  function adoptSnapshot(next: Performance, stale: boolean) {
+  function adoptSnapshot(next: Performance, stale: boolean): boolean {
     const current = sessionRef.current;
     if (stale) {
       if (!current || current.id !== next.id || next.version <= current.version) {
-        return;
+        return false;
       }
     } else if (current && current.id === next.id && current.version > next.version) {
-      return;
+      return false;
     }
     sessionRef.current = next;
     setSession(next);
+    return true;
   }
 
-  function runCommand(action: () => Promise<Performance>) {
+  /**
+   * Run one command. `onCommitted` runs only after the server has accepted
+   * the write (the returned snapshot is the committed one). Because the
+   * console is never unmounted by a tab switch, in-flight commands finish
+   * here regardless of which entry is visible.
+   */
+  function runCommand(
+    action: () => Promise<Performance>,
+    onCommitted?: (snapshot: Performance) => void,
+  ) {
     const gen = ++generationRef.current;
     commandInFlightRef.current += 1;
     setCommandBusy(true);
     setError(null);
     void action().then(
       (snapshot) => {
-        adoptSnapshot(snapshot, generationRef.current !== gen);
+        const adopted = adoptSnapshot(snapshot, generationRef.current !== gen);
+        // Follow-ups belong to the command's session; if the view has since
+        // moved to another session they must not touch the new session.
+        if (adopted) onCommitted?.(snapshot);
       },
       (err) => {
         if (generationRef.current !== gen) return;
@@ -110,8 +136,11 @@ export default function PerformanceConsole() {
   }
 
   // The only write entry: build a command envelope from the current snapshot.
-  function dispatch(command: Parameters<typeof submitPerformanceCommand>[0]) {
-    runCommand(() => submitPerformanceCommand(command));
+  function dispatch(
+    command: Parameters<typeof submitPerformanceCommand>[0],
+    onCommitted?: (snapshot: Performance) => void,
+  ) {
+    runCommand(() => submitPerformanceCommand(command), onCommitted);
   }
 
   function onCreate() {
@@ -169,14 +198,31 @@ export default function PerformanceConsole() {
       setError(reportError(err));
       return;
     }
-    setCueText('');
-    void dispatch({
-      command: 'registerCue',
-      performanceId: session.id,
-      cue,
-      expectedVersion: session.version,
-      requestId: newRequestId(),
-    });
+    // Keep the draft while the command is in flight: the request may still
+    // commit on the server even if the tab is switched before the response
+    // arrives, and a rejection (e.g. VERSION_CONFLICT) leaves the cue
+    // unregistered and must be retryable. Only clear once the server has
+    // confirmed the commit — and only the draft of the session the command
+    // actually belonged to.
+    const performanceId = session.id;
+    void dispatch(
+      {
+        command: 'registerCue',
+        performanceId,
+        cue,
+        expectedVersion: session.version,
+        requestId: newRequestId(),
+      },
+      (committed) => {
+        if (committed.id === performanceId) {
+          setCueDrafts((drafts) => {
+            const next = { ...drafts };
+            delete next[performanceId];
+            return next;
+          });
+        }
+      },
+    );
   }
 
   return (
@@ -191,8 +237,9 @@ export default function PerformanceConsole() {
               onChange={(e) => setName(e.target.value)}
               placeholder="场次名称，例如：9 月 17 日晚场"
               disabled={commandBusy}
+              data-testid="create-name"
             />
-            <button onClick={onCreate} disabled={commandBusy}>
+            <button onClick={onCreate} disabled={commandBusy} data-testid="create-button">
               创建
             </button>
           </span>
@@ -207,8 +254,9 @@ export default function PerformanceConsole() {
               placeholder="场次 ID（UUID）"
               disabled={loadBusy}
               spellCheck={false}
+              data-testid="load-id"
             />
-            <button className="secondary" onClick={onLoad} disabled={loadBusy}>
+            <button className="secondary" onClick={onLoad} disabled={loadBusy} data-testid="load-button">
               载入
             </button>
           </span>
@@ -216,7 +264,7 @@ export default function PerformanceConsole() {
       </div>
 
       {error && (
-        <div className="verdict error console-error" role="alert">
+        <div className="verdict error console-error" role="alert" data-testid="console-error">
           <strong>
             <code>{error.code}</code>
             {error.reason ? (
@@ -232,19 +280,21 @@ export default function PerformanceConsole() {
       )}
 
       {!session && (
-        <p className="console-empty">尚未打开场次：创建一场新演出，或按 ID 载入已有场次。</p>
+        <p className="console-empty" data-testid="console-empty">
+          尚未打开场次：创建一场新演出，或按 ID 载入已有场次。
+        </p>
       )}
 
       {session && (
-        <article className="session">
+        <article className="session" data-testid="session-card">
           <header className="session-head">
             <div>
-              <h2>{session.name}</h2>
+              <h2 data-testid="session-name">{session.name}</h2>
               <p className="session-id" title={session.id}>
-                ID：<code>{session.id}</code>
+                ID：<code data-testid="session-id">{session.id}</code>
               </p>
             </div>
-            <span className={`badge badge-${session.status}`}>
+            <span className={`badge badge-${session.status}`} data-testid="session-status">
               {STATUS_LABELS[session.status]}
             </span>
           </header>
@@ -252,23 +302,27 @@ export default function PerformanceConsole() {
           <dl className="facts">
             <div>
               <dt>版本</dt>
-              <dd>{session.version}</dd>
+              <dd data-testid="session-version">{session.version}</dd>
             </div>
             <div>
               <dt>已登记 cue</dt>
-              <dd>{session.cues.length}</dd>
+              <dd data-testid="cue-count">{session.cues.length}</dd>
             </div>
             <div className="fact-wide">
               <dt>最近提交请求标识</dt>
               <dd>
-                <code>{session.requestId ?? '—'}</code>
+                <code data-testid="session-request-id">{session.requestId ?? '—'}</code>
               </dd>
             </div>
           </dl>
 
           {session.status === 'pending' && (
             <div className="actions">
-              <button onClick={() => transition('running')} disabled={commandBusy}>
+              <button
+                onClick={() => transition('running')}
+                disabled={commandBusy}
+                data-testid="start-button"
+              >
                 开演（待演 → 运行）
               </button>
             </div>
@@ -277,10 +331,20 @@ export default function PerformanceConsole() {
           {session.status === 'running' && (
             <>
               <div className="actions">
-                <button className="secondary" onClick={() => transition('paused')} disabled={commandBusy}>
+                <button
+                  className="secondary"
+                  onClick={() => transition('paused')}
+                  disabled={commandBusy}
+                  data-testid="pause-button"
+                >
                   暂停
                 </button>
-                <button className="danger" onClick={() => transition('ended')} disabled={commandBusy}>
+                <button
+                  className="danger"
+                  onClick={() => transition('ended')}
+                  disabled={commandBusy}
+                  data-testid="end-button"
+                >
                   结束
                 </button>
               </div>
@@ -292,11 +356,16 @@ export default function PerformanceConsole() {
                       type="number"
                       step={1}
                       value={cueText}
-                      onChange={(e) => setCueText(e.target.value)}
+                      onChange={(e) => setCueTextFor(session.id, e.target.value)}
                       placeholder="整数 cue，如 101"
                       disabled={commandBusy}
+                      data-testid="cue-input"
                     />
-                    <button onClick={onRegisterCue} disabled={commandBusy}>
+                    <button
+                      onClick={onRegisterCue}
+                      disabled={commandBusy}
+                      data-testid="cue-register"
+                    >
                       登记
                     </button>
                   </span>
@@ -307,10 +376,19 @@ export default function PerformanceConsole() {
 
           {session.status === 'paused' && (
             <div className="actions">
-              <button onClick={() => transition('running')} disabled={commandBusy}>
+              <button
+                onClick={() => transition('running')}
+                disabled={commandBusy}
+                data-testid="resume-button"
+              >
                 继续（→ 运行）
               </button>
-              <button className="danger" onClick={() => transition('ended')} disabled={commandBusy}>
+              <button
+                className="danger"
+                onClick={() => transition('ended')}
+                disabled={commandBusy}
+                data-testid="end-button"
+              >
                 结束
               </button>
             </div>

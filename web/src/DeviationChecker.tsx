@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { ApiError, fetchDistance, type DistanceResponse } from './api';
 
 const SAMPLE_PLAN = '[101, 102, 103, 104, 105, 106, 107, 108]';
@@ -12,9 +12,16 @@ class ClientError extends Error {
   }
 }
 
-type Outcome =
-  | { kind: 'result'; value: DistanceResponse }
-  | { kind: 'error'; code: string; message: string };
+interface Outcome {
+  kind: 'result' | 'error';
+  // Identity of the comparison that produced this verdict. The checker stays
+  // mounted across tab switches, so an older comparison may resolve after a
+  // newer one; only the latest comparison is allowed to surface its verdict.
+  seq: number;
+  value?: DistanceResponse;
+  code?: string;
+  message?: string;
+}
 
 function parseJsonArray(text: string, label: string): unknown[] {
   let parsed: unknown;
@@ -40,37 +47,52 @@ function parseK(text: string): number {
   return k;
 }
 
-/** Independent entry 1: planned-vs-live cue sequence deviation checker. */
+/** Independent entry 2: planned-vs-live cue sequence deviation checker. */
 export default function DeviationChecker() {
   const [planText, setPlanText] = useState(SAMPLE_PLAN);
   const [liveText, setLiveText] = useState(SAMPLE_LIVE);
   const [kText, setKText] = useState('3');
-  const [busy, setBusy] = useState(false);
+  const [inFlight, setInFlight] = useState(0);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
 
+  // Identity of the latest comparison. This entry is never unmounted when the
+  // user switches to the console tab and back, so a request already on the
+  // wire keeps its identity and still settles here; when comparisons overlap
+  // (including one started while another is still in flight), a stale
+  // response can never overwrite the freshest conclusion.
+  const seqRef = useRef(0);
+
   async function onCompare() {
-    setBusy(true);
+    const seq = ++seqRef.current;
+    setInFlight((n) => n + 1);
+    // A new comparison supersedes any verdict currently shown, but the
+    // inputs of both the prior and the new comparison are preserved.
     setOutcome(null);
     try {
       const a = parseJsonArray(planText, '计划 cue 序列');
       const b = parseJsonArray(liveText, '现场触发序列');
       const k = parseK(kText);
       const value = await fetchDistance(a, b, k);
-      setOutcome({ kind: 'result', value });
+      if (seqRef.current !== seq) return;
+      setOutcome({ kind: 'result', seq, value });
     } catch (err) {
+      if (seqRef.current !== seq) return;
       if (err instanceof ClientError || err instanceof ApiError) {
-        setOutcome({ kind: 'error', code: err.code, message: err.message });
+        setOutcome({ kind: 'error', seq, code: err.code, message: err.message });
       } else {
         setOutcome({
           kind: 'error',
+          seq,
           code: 'NETWORK',
           message: '无法连接校验服务，请确认 API 已启动。',
         });
       }
     } finally {
-      setBusy(false);
+      setInFlight((n) => n - 1);
     }
   }
+
+  const busy = inFlight > 0;
 
   return (
     <section>
@@ -83,6 +105,7 @@ export default function DeviationChecker() {
             spellCheck={false}
             rows={10}
             placeholder="[101, 102, 103]"
+            data-testid="plan-input"
           />
         </label>
         <label className="editor">
@@ -93,6 +116,7 @@ export default function DeviationChecker() {
             spellCheck={false}
             rows={10}
             placeholder="[101, 102, 104]"
+            data-testid="live-input"
           />
         </label>
       </section>
@@ -107,30 +131,38 @@ export default function DeviationChecker() {
             step={1}
             value={kText}
             onChange={(e) => setKText(e.target.value)}
+            data-testid="k-input"
           />
         </label>
-        <button onClick={onCompare} disabled={busy}>
-          {busy ? '校验中…' : '比较'}
+        <button onClick={onCompare} data-testid="compare-button">
+          {busy ? `校验中…（在途 ${inFlight}）` : '比较'}
         </button>
       </section>
 
       {outcome?.kind === 'error' && (
-        <section className="verdict error" role="alert">
+        <section className="verdict error" role="alert" data-testid="deviation-error">
           <h2>❌ 输入无效</h2>
+          <p className="verdict-seq" data-testid="deviation-verdict-seq">
+            第 {outcome.seq} 次比较的结论
+          </p>
           <p>
             <code>{outcome.code}</code>：{outcome.message}
           </p>
         </section>
       )}
 
-      {outcome?.kind === 'result' && (
+      {outcome?.kind === 'result' && outcome.value && (
         <section
           className={outcome.value.status === 'ok' ? 'verdict ok' : 'verdict exceeded'}
           role="status"
+          data-testid="deviation-verdict"
         >
           {outcome.value.status === 'ok' ? (
             <>
               <h2>✅ 偏差在容许范围内</h2>
+              <p className="verdict-seq" data-testid="deviation-verdict-seq">
+                第 {outcome.seq} 次比较的结论
+              </p>
               <p className="headline">
                 精确偏差距离 <strong>{outcome.value.distance}</strong> ≤ 阈值 K ={' '}
                 {outcome.value.k}
@@ -139,6 +171,9 @@ export default function DeviationChecker() {
           ) : (
             <>
               <h2>⚠️ 偏差超出容许范围</h2>
+              <p className="verdict-seq" data-testid="deviation-verdict-seq">
+                第 {outcome.seq} 次比较的结论
+              </p>
               <p className="headline">
                 实际偏差距离大于阈值 K = {outcome.value.k}（服务仅返回 exceeded 信号）
               </p>

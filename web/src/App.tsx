@@ -35,7 +35,29 @@ export default function App() {
         ))}
       </nav>
 
-      {tab === 'console' ? <PerformanceConsole /> : <DeviationChecker />}
+      {/*
+        Both entries stay mounted for the whole page lifetime: switching tabs
+        only toggles visibility, never unmounts. Each entry therefore keeps
+        its own open session, version, timeline, drafts, busy/error state and
+        — decisively — the Promise callbacks of every request still in
+        flight. A command or comparison that resolves while its entry is
+        hidden is delivered to exactly that entry (and, for commands, the
+        session it was sent for); a failure can never wipe the other entry.
+      */}
+      <div
+        role="tabpanel"
+        data-testid="console-panel"
+        style={{ display: tab === 'console' ? 'block' : 'none' }}
+      >
+        <PerformanceConsole />
+      </div>
+      <div
+        role="tabpanel"
+        data-testid="deviation-panel"
+        style={{ display: tab === 'deviation' ? 'block' : 'none' }}
+      >
+        <DeviationChecker />
+      </div>
     </main>
   );
 }
